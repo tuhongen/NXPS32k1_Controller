@@ -1,0 +1,791 @@
+/* ###################################################################
+**     Filename    : main.c
+**     Processor   : S32K1xx
+**     Abstract    :
+**         Main module.
+**         This module contains user's application code.
+**     Settings    :
+**     Contents    :
+**         No public methods
+**
+** ###################################################################*/
+/*!
+** @file main.c
+** @version 01.00
+** @brief
+**         Main module.
+**         This module contains user's application code.
+*/
+/*!
+**  @addtogroup main_module main module documentation
+**  @{
+*/
+/* MODULE main */
+
+
+/* Including needed modules to compile this module/procedure */
+#include "Cpu.h"
+#include "clockMan1.h"
+#include "dmaController1.h"
+#include "lpspiCom1.h"
+#include "flexTimer_pwm1.h"
+#include "flexTimer_pwm2.h"
+#include "canCom0.h"
+#include "canCom1.h"
+#include "canCom2.h"
+//#include "lpTmr1.h"
+#include "lpit1.h"
+#include "pin_mux.h"
+
+#if CPU_INIT_CONFIG
+  #include "Init_Config.h"
+#endif
+
+#include <stdint.h>
+#include <stdbool.h>
+
+/******************************************************************************
+ * Definitions
+ ******************************************************************************/
+
+/* This example is setup to work by default with EVB. To use it with other boards
+   please comment the following line
+*/
+
+/* Definition of GPIO */
+//input
+#define ManualBrake 9U   	//PTA 9  INPUT
+#define ManualBrake_Port PTA   	//PTA 9  INPUT
+#define ManualAccel 15U     //PTE 15  INPUT
+#define ManualAccel_Port PTE     //PTE 15  INPUT
+//output
+#define AutoBrakeStatus 0U   //PTD 0         OUTPUT
+#define AutoBrakeStatus_Port PTD   //PTD 0         OUTPUT
+//#define AutoAccelStatus 3U
+#define AutoAccelStatus 16U  //PTE 16       OUTPUT
+#define AutoAccelStatus_Port PTE  //PTE 16       OUTPUT
+#define cs1 6U    			 //PTA 6        OUTPUT
+#define cs1_Port PTA    			 //PTA 6        OUTPUT
+#define cs2 16U  			 //PTA 16       OUTPUT
+#define cs2_Port PTA  			 //PTA 16       OUTPUT
+#define LED 13U  			 //PTC 13
+#define LED_Port PTC  			 //PTC 13
+//#define LED2 16 			 //PTD 16  LED2 on EVK
+
+/* Definition of SPI */
+
+#define NUMBER_OF_FRAMES 1U
+#define BUFFER_SIZE 4U
+#define TIMEOUT 5U
+
+
+/* Definition of CAN */
+#define TX_MAILBOX  (1UL)
+#define TX_MSG_ID   (1UL)
+#define RX_MAILBOX  (0UL)
+#define RX_MSG_ID   (2UL)
+
+/* LPIT channel used */
+#define LPIT_CHANNEL0        0UL
+#define LPIT_CHANNEL1        1UL
+#define LPIT_CHANNEL2        2UL
+#define LPIT_CHANNEL3        3UL
+#define LPIT_Channel0_IRQn   LPIT0_Ch0_IRQn
+#define LPIT_Channel1_IRQn   LPIT0_Ch1_IRQn
+#define LPIT_Channel2_IRQn   LPIT0_Ch2_IRQn
+#define LPIT_Channel3_IRQn   LPIT0_Ch3_IRQn
+
+uint32_t 	CntrlMsgID = 0x160;
+uint32_t 	StateMsgID = 0x161;
+uint32_t 	n=0;
+/* Define send buffer */
+flexcan_msgbuff_t sendBuff;
+/* Define receive buffer */
+flexcan_msgbuff_t recvBuff;
+
+uint16_t 	tem=0;
+uint16_t 	accelVol=0;
+uint16_t 	brakePWM=0;
+uint16_t 	volNew=0;
+uint16_t 	pwmNew=0;
+uint8_t 	autoAccel=0;
+uint8_t 	autoBrake=0;
+uint8_t		manualCmd=0;
+uint8_t		counterEN=0;
+
+/* Variables used for SPI */
+uint16_t 	voltageA, voltageB;
+uint16_t 	volAl  =   0x147;
+uint16_t 	volBl  =   0xa8;
+uint16_t 	volAu  =   0x635;
+uint16_t 	volBu  =   0x333;
+
+/* Variables used for PWM */
+uint16_t 	dutyCycleA, dutyCycleB;
+uint16_t 	CycleAl  =   28115U;
+uint16_t 	CycleBl  =   4620U;
+uint16_t 	CycleAu  =   19300U;
+uint16_t 	CycleBu  =   13435U;
+ftm_state_t ftmStateStruct;
+
+volatile bool dataReceived = false;
+volatile bool manualFlag = false;
+volatile bool automaFlag = false;
+volatile bool brakeActiv = false;
+volatile bool accelActiv = false;
+
+typedef struct
+{
+	uint32_t tx[NUMBER_OF_FRAMES];
+	uint32_t rx[NUMBER_OF_FRAMES];
+} spi_buffer_t;
+
+spi_buffer_t 	master_buffer, slave_buffer;
+
+flexcan_data_info_t dataInfo =
+{
+	.data_length = 8u,
+	.msg_id_type = FLEXCAN_MSG_ID_STD,
+	.enable_brs  = true,
+	.fd_enable   = false,
+	.fd_padding  = 0U
+};
+
+/******************************************************************************
+ * Function prototypes
+ ******************************************************************************/
+
+/* Initialization */
+void BoardInit(void);
+void GPIOInit(void);
+void FlexCANInit(void);
+void LPSPInit(void);
+void PWMInit(void);
+void LPTMRInit(void);
+
+/* Function */
+void SendCANData(uint8_t can_channel, uint8_t mailbox, uint32_t messageId, uint8_t * data);
+void UpdateSPI(uint16_t value, uint8_t pin_index);
+void InitSPIBuffer(spi_buffer_t * spiBuffer, bool master);
+void AutoControl(void);
+
+/* Interrupt handler */
+void CAN0receiveCallBack(void);
+void CAN1receiveCallBack(void);
+void CAN2receiveCallBack(void);
+void Brake_AutoManualISR(void);
+void ACC_AutoManualISR(void);
+void LPIT_ISR_50ms(void);
+void LPIT_ISR_500ms(void);
+void LPIT_ISR_1s(void);
+void LPIT_ISR_2s(void);
+/******************************************************************************
+ * Functions
+ ******************************************************************************/
+
+/*
+ * @brief : Initialize clocks, pins and power modes
+ */
+void BoardInit(void)
+{
+    /* Initialize and configure clocks
+     *  -   Setup system clocks, dividers
+     *  -   Configure FlexCAN clock, GPIO
+     *  -   see clock manager component for more details
+     */
+    CLOCK_SYS_Init(g_clockManConfigsArr, CLOCK_MANAGER_CONFIG_CNT,
+                        g_clockManCallbacksArr, CLOCK_MANAGER_CALLBACK_CNT);
+    CLOCK_SYS_UpdateConfiguration(0U, CLOCK_MANAGER_POLICY_FORCIBLE);
+
+    /* Initialize pins
+     *  -   Init LPSPI, FTM, FlexCAN, GPIO and LPTMR pins
+     *  -   See PinSettings component for more info
+     */
+    PINS_DRV_Init(NUM_OF_CONFIGURED_PINS, g_pin_mux_InitConfigArr);
+}
+
+/*
+ * @brief Function which configures the input and output
+ */
+void GPIOInit(void)
+{
+	/* Configure SPI chip select output
+	 *  -   Disable SPI chip select
+	 *  -   Set output high
+	 */
+	PINS_DRV_WritePin(PTA,cs1,1);
+	PINS_DRV_WritePin(PTD,cs2,1);
+
+	/* Configure Manual-Auto mode
+	 *  -   Disable auto mode
+	 *  -   Set auto mode output low
+	 */
+    PINS_DRV_ClearPins(PTD, 1 << AutoBrakeStatus);
+//	PINS_DRV_ClearPins(PTA, 1 << AutoAccelStatus);
+	PINS_DRV_ClearPins(PTE, 1 << AutoAccelStatus);
+
+	/* Configure Manual mode interrupt
+	 *  -   Clear manual mode input
+	 *  -   Set manual mode input low
+	 */
+//	PINS_DRV_ClearPins(PTA, 1 << ManualBrake);
+//	PINS_DRV_ClearPins(PTE, 1 << ManualAccel);
+
+    /* Setup manual mode input pins interrupt */
+    PINS_DRV_SetPinIntSel(PORTA, ManualBrake, PORT_INT_RISING_EDGE);
+    PINS_DRV_SetPinIntSel(PORTE, ManualAccel, PORT_INT_RISING_EDGE);
+
+    /* Install manual mode checking ISR */
+    INT_SYS_InstallHandler(PORTA_IRQn, &Brake_AutoManualISR, NULL);
+    INT_SYS_InstallHandler(PORTE_IRQn, &ACC_AutoManualISR, NULL);
+    /* Enable manual mode checking interrupt */
+    INT_SYS_EnableIRQ(PORTA_IRQn);
+    INT_SYS_EnableIRQ(PORTE_IRQn);
+}
+
+/*
+ * @brief Initialize LPSPI driver
+ */
+void LPSPInit(void)
+{
+	/* Initialize and configure lpspi
+	*  -   clock speed: 500 kHz
+	*  -   bits/frame: 	24
+	*  -   pcs polarity:active low
+	*  -   direction: 	MSB first
+	*/
+	LPSPI_DRV_MasterInit(LPSPICOM1, &lpspiCom1State, &lpspiCom1_MasterConfig0);
+
+	/* Setup initial value */
+	UpdateSPI(volAl, cs1);
+	UpdateSPI(volBl, cs2);
+}
+
+/*
+ * @brief Initialize PWM driver
+ */
+void PWMInit(void)
+{
+	/* Initialize and configure pwm1
+	*  -   frequency:	526 Hz
+	*  -   period value:11400
+	*  -   duty cycle: 	28115U(0x0~0x8000 -> 0%~100%)
+	*/
+	/* Initialize FTM0 PWM1 channel 7 PTE9 */
+	FTM_DRV_Init(INST_FLEXTIMER_PWM1, &flexTimer_pwm1_InitConfig, &ftmStateStruct);
+
+	/* Initialize FTM0 PWM1 */
+	FTM_DRV_InitPwm(INST_FLEXTIMER_PWM1, &flexTimer_pwm1_PwmConfig);
+
+	/* Initialize and configure pwm2
+	*  -   frequency:	476 Hz
+	*  -   period value:12600
+	*  -   duty cycle: 	4620U(0x0~0x8000 -> 0%~100%)
+	*/
+	/* Initialize FTM2 PWM2 channel 4 PTE10 */
+	FTM_DRV_Init(INST_FLEXTIMER_PWM2, &flexTimer_pwm2_InitConfig, &ftmStateStruct);
+
+	/* Initialize FTM2 PWM2 */
+	FTM_DRV_InitPwm(INST_FLEXTIMER_PWM2, &flexTimer_pwm2_PwmConfig);
+}
+
+/*
+ * @brief Initialize FlexCAN driver and configure the bit rate
+ */
+void FlexCANInit(void)
+{
+    /* Initialize FlexCAN driver
+     *  - 8 byte payload size
+     *  - FD disabled
+     *  - Bus clock as peripheral engine clock
+     */
+	FLEXCAN_DRV_Init(INST_CANCOM0, &canCom0_State, &canCom0_InitConfig0);
+    FLEXCAN_DRV_Init(INST_CANCOM1, &canCom1_State, &canCom1_InitConfig0);
+    FLEXCAN_DRV_Init(INST_CANCOM2, &canCom2_State, &canCom2_InitConfig0);
+
+    /* Set information about the data to be sent
+	 *  - 8 byte in length
+	 *  - Standard message ID
+	 *  - Bit rate switch enabled to use a different bit rate for the data segment
+	 *  - Flexible data rate disabled
+	 *  - Use zeros for FD padding
+	 */
+	flexcan_data_info_t dataInfo =
+	{
+		.data_length = 8u,
+		.msg_id_type = FLEXCAN_MSG_ID_STD,
+		.enable_brs  = true,
+		.fd_enable   = false,
+		.fd_padding  = 0U
+	};
+
+	sendBuff.data[0]=0x11;
+	/* Execute send non-blocking */
+	FLEXCAN_DRV_Send(INST_CANCOM0, TX_MAILBOX, &dataInfo, 0x123, sendBuff.data);
+	FLEXCAN_DRV_Send(INST_CANCOM1, TX_MAILBOX, &dataInfo, 0x123, sendBuff.data);
+	FLEXCAN_DRV_Send(INST_CANCOM2, TX_MAILBOX, &dataInfo, 0x123, sendBuff.data);
+	sendBuff.data[0]=0x0;
+
+	/* Configure RX message buffer with index RX_MSG_ID and RX_MAILBOX */
+	FLEXCAN_DRV_ConfigRxMb(INST_CANCOM0, RX_MAILBOX, &dataInfo, CntrlMsgID);
+	FLEXCAN_DRV_ConfigRxMb(INST_CANCOM1, RX_MAILBOX, &dataInfo, CntrlMsgID);
+	FLEXCAN_DRV_ConfigRxMb(INST_CANCOM2, RX_MAILBOX, &dataInfo, CntrlMsgID);
+		FLEXCAN_DRV_InstallEventCallback(INST_CANCOM0, CAN0receiveCallBack, 0);
+		FLEXCAN_DRV_InstallEventCallback(INST_CANCOM1, CAN1receiveCallBack, 0);
+		FLEXCAN_DRV_InstallEventCallback(INST_CANCOM2, CAN2receiveCallBack, 0);
+}
+
+void LPTMRInit(void)
+{
+    /* Initialize LPIT instance 0
+     *  -   Reset and enable peripheral
+     */
+    LPIT_DRV_Init(INST_LPIT1, &lpit1_InitConfig);
+
+    /* Initialize LPIT channel 0 and configure it as a periodic counter
+     * which is used to generate an interrupt.
+     */
+    LPIT_DRV_InitChannel(INST_LPIT1, LPIT_CHANNEL0, &lpit1_ChnConfig0);
+    LPIT_DRV_InitChannel(INST_LPIT1, LPIT_CHANNEL1, &lpit1_ChnConfig1);
+    LPIT_DRV_InitChannel(INST_LPIT1, LPIT_CHANNEL2, &lpit1_ChnConfig2);
+    LPIT_DRV_InitChannel(INST_LPIT1, LPIT_CHANNEL3, &lpit1_ChnConfig3);
+    /* Install LPIT_ISR as LPIT interrupt handler */
+    INT_SYS_InstallHandler(LPIT_Channel0_IRQn, &LPIT_ISR_50ms, (isr_t *)0);
+    INT_SYS_InstallHandler(LPIT_Channel1_IRQn, &LPIT_ISR_500ms, (isr_t *)0);
+    INT_SYS_InstallHandler(LPIT_Channel2_IRQn, &LPIT_ISR_1s, (isr_t *)0);
+    INT_SYS_InstallHandler(LPIT_Channel3_IRQn, &LPIT_ISR_2s, (isr_t *)0);
+    /* Start LPIT0 channel 0 counter */
+    LPIT_DRV_StartTimerChannels(INST_LPIT1, (1 << LPIT_CHANNEL0));
+    LPIT_DRV_StartTimerChannels(INST_LPIT1, (1 << LPIT_CHANNEL1));
+    LPIT_DRV_StartTimerChannels(INST_LPIT1, (1 << LPIT_CHANNEL2));
+    LPIT_DRV_StartTimerChannels(INST_LPIT1, (1 << LPIT_CHANNEL3));
+    /* Peripherals Initialization is complete, now the program will wait for
+     * LPIT interrupt.
+     */
+
+}
+/*
+ * @brief: Send data via CAN to the specified mailbox with the specified message id
+ * @param mailbox   : Destination mailbox number
+ * @param messageId : Message ID
+ * @param data      : Pointer to the TX data
+ * @param len       : Length of the TX data
+ * @return          : None
+ */
+void SendCANData(uint8_t can_channel, uint8_t mailbox, uint32_t messageId, uint8_t * data)
+{
+	/* Get error status */
+	if (FLEXCAN_DRV_GetErrorStatus(can_channel) != 0) {
+		/* Ends a non-blocking FlexCAN transfer early */
+		FLEXCAN_DRV_AbortTransfer(can_channel, mailbox);
+	}
+
+    /* Configure TX message buffer with index TX_MSG_ID and TX_MAILBOX */
+    FLEXCAN_DRV_ConfigTxMb(can_channel, mailbox, &dataInfo, messageId);
+
+    /* Execute send non-blocking */
+    FLEXCAN_DRV_Send(can_channel, mailbox, &dataInfo, messageId, data);
+}
+
+/*
+ * @brief: Update SPI data
+ * @param value 	: data
+ * @param pin_index : chip select index of GPIO
+ * @return          : None
+ */
+void UpdateSPI(uint16_t value, uint8_t pin_index)
+{
+	tem=value;
+	InitSPIBuffer(&master_buffer, true);
+	/* select chip */
+	PINS_DRV_WritePin(PTA,pin_index,0);
+//	LPSPI_DRV_MasterTransferBlocking(LPSPICOM1, master_buffer.tx, NULL, BUFFER_SIZE, TIMEOUT);
+	LPSPI_DRV_MasterTransfer(LPSPICOM1, master_buffer.tx, NULL, BUFFER_SIZE);
+	while(LPSPI_DRV_MasterGetTransferStatus(LPSPICOM1, master_buffer.rx)>0);
+	PINS_DRV_WritePin(PTA,pin_index,1);
+	LPSPI_DRV_MasterAbortTransfer(LPSPICOM1);
+}
+
+void AutoControl(void)
+{
+//	PINS_DRV_WritePin(PTD,15,1);
+
+	/* Auto mode */
+	if (automaFlag && !manualFlag){
+
+		/* Enable auto mode by setting output high */
+		if (accelActiv){
+//			PINS_DRV_SetPins(PTA, 1 << AutoAccelStatus);
+			PINS_DRV_SetPins(PTE, 1 << AutoAccelStatus);
+//			PINS_DRV_ClearPins(PTA, 1 << AutoAccelStatus);
+		} else {
+//			PINS_DRV_ClearPins(PTA, 1 << AutoAccelStatus);
+			PINS_DRV_ClearPins(PTE, 1 << AutoAccelStatus);
+//			PINS_DRV_SetPins(PTA, 1 << AutoAccelStatus);
+			accelVol = 0;
+		}
+		if (brakeActiv){
+			PINS_DRV_SetPins(PTD, 1 << AutoBrakeStatus);
+//			PINS_DRV_ClearPins(PTA, 1 << AutoBrakeStatus);
+		} else {
+			PINS_DRV_ClearPins(PTD, 1 << AutoBrakeStatus);
+//			PINS_DRV_SetPins(PTA, 1 << AutoBrakeStatus);
+			brakePWM = 0;
+		}
+
+		/* Update auto control command */
+		if (brakePWM>0){
+			accelVol=0x0;
+			voltageA = volAl + (volAu-volAl)*accelVol/0xff;
+			/* select chip one */
+			UpdateSPI(voltageA, cs1);
+
+			voltageB = volBl + (volBu-volBl)*accelVol/0xff;
+			/* select chip two */
+			UpdateSPI(voltageB, cs2);
+
+			dutyCycleA=CycleAl + (CycleAu-CycleAl)*brakePWM/0xff;
+			FTM_DRV_UpdatePwmChannel(INST_FLEXTIMER_PWM1, 0U, FTM_PWM_UPDATE_IN_DUTY_CYCLE, dutyCycleA, 0U, true);
+
+			dutyCycleB=CycleBl + (CycleBu-CycleBl)*brakePWM/0xff;
+			FTM_DRV_UpdatePwmChannel(INST_FLEXTIMER_PWM2, 0U, FTM_PWM_UPDATE_IN_DUTY_CYCLE, dutyCycleB, 0U, true);
+		} else {
+			brakePWM=0;
+			dutyCycleA=CycleAl + (CycleAu-CycleAl)*brakePWM/0xff;
+			FTM_DRV_UpdatePwmChannel(INST_FLEXTIMER_PWM1, 0U, FTM_PWM_UPDATE_IN_DUTY_CYCLE, dutyCycleA, 0U, true);
+
+			dutyCycleB=CycleBl + (CycleBu-CycleBl)*brakePWM/0xff;
+			FTM_DRV_UpdatePwmChannel(INST_FLEXTIMER_PWM2, 0U, FTM_PWM_UPDATE_IN_DUTY_CYCLE, dutyCycleB, 0U, true);
+
+			voltageA = volAl + (volAu-volAl)*accelVol/0xff;
+			/* select chip one */
+			UpdateSPI(voltageA, cs1);
+
+			voltageB = volBl + (volBu-volBl)*accelVol/0xff;
+			/* select chip two */
+			UpdateSPI(voltageB, cs2);
+		}
+	} else {
+		accelVol=0;
+		voltageA = volAl + (volAu-volAl)*accelVol/0xff;
+		/* select chip one */
+		UpdateSPI(voltageA, cs1);
+
+		voltageB = volBl + (volBu-volBl)*accelVol/0xff;
+		/* select chip two */
+		UpdateSPI(voltageB, cs2);
+
+		brakePWM=0;
+		dutyCycleA=CycleAl + (CycleAu-CycleAl)*brakePWM/0xff;
+		FTM_DRV_UpdatePwmChannel(INST_FLEXTIMER_PWM1, 0U, FTM_PWM_UPDATE_IN_DUTY_CYCLE, dutyCycleA, 0U, true);
+
+		dutyCycleB=CycleBl + (CycleBu-CycleBl)*brakePWM/0xff;
+		FTM_DRV_UpdatePwmChannel(INST_FLEXTIMER_PWM2, 0U, FTM_PWM_UPDATE_IN_DUTY_CYCLE, dutyCycleB, 0U, true);
+	}
+
+//	PINS_DRV_ClearPins(PTD, 1 << 15);
+}
+
+void InitSPIBuffer(spi_buffer_t * spiBuffer, bool master)
+{
+	if (tem>2047){
+		tem=0;
+	}
+	spiBuffer->tx[0] = tem<<4;
+
+	spiBuffer->rx[0] = 0x0;
+}
+
+/**
+ * Button interrupt handler
+ */
+
+void CAN0receiveCallBack(void)
+{
+	FLEXCAN_DRV_Receive(INST_CANCOM0, RX_MAILBOX, &recvBuff);
+}
+
+
+void CAN1receiveCallBack(void)
+{
+	FLEXCAN_DRV_Receive(INST_CANCOM1, RX_MAILBOX, &recvBuff);
+
+	/* Update control message 0x160 */
+	if (recvBuff.msgId == CntrlMsgID){
+		if (autoAccel != recvBuff.data[2]){
+			autoAccel = recvBuff.data[2];
+			dataReceived=true;
+
+			if (autoAccel==0x1){
+				volNew = 0;
+			} else {
+				pwmNew = 0;
+			}
+		}
+		if (autoBrake != recvBuff.data[6]){
+			autoBrake = recvBuff.data[6];
+			dataReceived=true;
+
+			if (autoBrake==0x1){
+				pwmNew = 0;
+			} else {
+				volNew = 0;
+			}
+		}
+
+		if (manualCmd!=recvBuff.data[0]){
+			manualCmd=recvBuff.data[0];
+			manualFlag = false;
+
+			accelVol = recvBuff.data[3];
+			brakePWM = recvBuff.data[7];
+			dataReceived=true;
+		}
+
+		if (!manualFlag){
+			if (autoAccel==0x1){
+				accelActiv = true;
+
+				if (volNew!=recvBuff.data[3]) {
+					accelVol = recvBuff.data[3];
+					dataReceived=true;
+					volNew = recvBuff.data[3];
+				}
+			} else {
+				accelActiv = false;
+			}
+
+			if (autoBrake==0x1){
+				brakeActiv = true;
+
+				if (pwmNew!=recvBuff.data[7]) {
+					brakePWM = recvBuff.data[7];
+					dataReceived=true;
+					pwmNew = recvBuff.data[7];
+				}
+			} else {
+				brakeActiv = false;
+			}
+
+			if (accelActiv || brakeActiv){
+				automaFlag = true;
+			}
+		}
+
+		if (counterEN!=recvBuff.data[4]){
+			counterEN = recvBuff.data[4];
+
+			if (counterEN == 0x10){
+				/* Start LPTMR counter */
+			//	LPTMR_DRV_StartCounter(INST_LPTMR1);
+				LPIT_DRV_StartTimerChannels(INST_LPIT1, (1 << LPIT_CHANNEL0));
+			} else {
+			//	LPTMR_DRV_StopCounter(INST_LPTMR1);
+				LPIT_DRV_StopTimerChannels(INST_LPIT1, (1 << LPIT_CHANNEL0));
+			}
+		}
+	}
+}
+
+void CAN2receiveCallBack(void)
+{
+	FLEXCAN_DRV_Receive(INST_CANCOM2, RX_MAILBOX, &recvBuff);
+}
+
+/**
+ * Manual mode interrupt handler
+ */
+void Brake_AutoManualISR(void)
+{
+	/* Check if brake pedal or accelerator pedal was pressed */
+	uint32_t pedalPressed =  PINS_DRV_GetPortIntFlag(PORTA) & (1 << ManualBrake);
+//	uint32_t pedalPressed = PINS_DRV_GetPortIntFlag(PORTA) & (1 << ManualBrake);
+
+	if(pedalPressed != 0)
+	{
+		/* Disable auto mode according to the input pins */
+		switch (pedalPressed)
+		{
+			case (1 << ManualBrake):
+				manualFlag = true;
+				/* Clear interrupt flag */
+				PINS_DRV_ClearPinIntFlagCmd(PORTA, ManualBrake);
+				break;
+
+			default:
+				PINS_DRV_ClearPortIntFlagCmd(PORTA);
+				break;
+		}
+		if(manualFlag){
+			/* Disable auto mode by setting output low */
+			PINS_DRV_ClearPins(PTD, 1 << AutoBrakeStatus);
+//			PINS_DRV_ClearPins(PTA, 1 << AutoAccelStatus);
+			PINS_DRV_ClearPins(PTE, 1 << AutoAccelStatus);
+
+			dataReceived=true;
+		}
+	}
+}
+
+void ACC_AutoManualISR(void)
+{
+	/* Check if brake pedal or accelerator pedal was pressed */
+	uint32_t pedalPressed = PINS_DRV_GetPortIntFlag(PORTE) & (1 << ManualAccel);
+//	uint32_t pedalPressed = PINS_DRV_GetPortIntFlag(PORTA) & (1 << ManualBrake);
+
+	if(pedalPressed != 0)
+	{
+		/* Disable auto mode according to the input pins */
+		switch (pedalPressed)
+		{
+
+			case (1 << ManualAccel):
+				manualFlag = true;
+				/* Clear interrupt flag */
+				PINS_DRV_ClearPinIntFlagCmd(PORTE, ManualAccel);
+				break;
+			default:
+				PINS_DRV_ClearPortIntFlagCmd(PORTE);
+				break;
+		}
+		if(manualFlag){
+			/* Disable auto mode by setting output low */
+			PINS_DRV_ClearPins(PTD, 1 << AutoBrakeStatus);
+//			PINS_DRV_ClearPins(PTA, 1 << AutoAccelStatus);
+			PINS_DRV_ClearPins(PTE, 1 << AutoAccelStatus);
+
+			dataReceived=true;
+		}
+	}
+}
+
+
+/**
+ * Input status update per 50ms handler
+ */
+void LPIT_ISR_50ms(void)
+{
+    /* Clear LPIT channel flag */
+    LPIT_DRV_ClearInterruptFlagTimerChannels(INST_LPIT1, (1 << LPIT_CHANNEL0));
+
+    /* Read manual status */
+	uint32_t pedalStatus = (PINS_DRV_ReadPins(PTA) & (1 << ManualBrake)) | (PINS_DRV_ReadPins(PTE)&(1 << ManualAccel));
+//	uint32_t pedalStatus = PINS_DRV_ReadPins(PTA) & (1 << ManualBrake);
+
+	/* Check manual status */
+	if(pedalStatus != 0) {
+		manualFlag = true;
+	}
+	sendBuff.data[0] = manualFlag;
+	sendBuff.data[1] = pedalStatus;
+//    sendBuff.data[2] = (PINS_DRV_GetPinsOutput(PTA) & (1 << AutoAccelStatus))>>AutoAccelStatus;
+	sendBuff.data[2] = (PINS_DRV_GetPinsOutput(PTE) & (1 << AutoAccelStatus))>>AutoAccelStatus;
+    sendBuff.data[3] = accelVol;
+    sendBuff.data[6] = (PINS_DRV_GetPinsOutput(PTD) & (1 << AutoBrakeStatus))>>AutoBrakeStatus;
+    sendBuff.data[7] = brakePWM;
+
+	/* Execute send non-blocking */
+	SendCANData(INST_CANCOM0,TX_MAILBOX, StateMsgID, sendBuff.data);
+	SendCANData(INST_CANCOM1,TX_MAILBOX, StateMsgID, sendBuff.data);
+	SendCANData(INST_CANCOM2,TX_MAILBOX, StateMsgID, sendBuff.data);
+   // PINS_DRV_TogglePins(PTD,1 << LED2);
+ //   PINS_DRV_TogglePins(PTC,1 << LED);
+    //PINS_DRV_SetPins(PTC,1 << LED);
+	//PINS_DRV_TogglePins(PTC,1 << LED);
+}
+
+void LPIT_ISR_500ms(void)
+{
+    /* Clear LPIT channel flag */
+    LPIT_DRV_ClearInterruptFlagTimerChannels(INST_LPIT1, (1 << LPIT_CHANNEL1));
+
+
+    PINS_DRV_TogglePins(PTC,1 << LED);
+    //PINS_DRV_SetPins(PTC,1 << LED);
+	//PINS_DRV_TogglePins(PTC,1 << LED);
+}
+
+void LPIT_ISR_1s(void)
+{
+    /* Clear LPIT channel flag */
+    LPIT_DRV_ClearInterruptFlagTimerChannels(INST_LPIT1, (1 << LPIT_CHANNEL2));
+}
+void LPIT_ISR_2s(void)
+{
+    /* Clear LPIT channel flag */
+    LPIT_DRV_ClearInterruptFlagTimerChannels(INST_LPIT1, (1 << LPIT_CHANNEL3));
+}
+volatile int exit_code = 0;
+/* User includes (#include below this line is not maintained by Processor Expert) */
+
+/*!
+  \brief The main function for the project.
+  \details The startup initialization sequence is the following:
+ * - __start (startup asm routine)
+ * - __init_hardware()
+ * - main()
+ *   - PE_low_level_init()
+ *     - Common_Init()
+ *     - Peripherals_Init()
+*/
+int main(void)
+{
+  /*** Processor Expert internal initialization. DON'T REMOVE THIS CODE!!! ***/
+  #ifdef PEX_RTOS_INIT
+    PEX_RTOS_INIT();                 /* Initialization of the selected RTOS. Macro is defined by the RTOS component. */
+  #endif
+  /*** End of Processor Expert internal initialization.                    ***/
+
+    /* Do the initializations required for this application */
+	BoardInit();
+	GPIOInit();
+	FlexCANInit();
+	LPSPInit();
+	PWMInit();
+	LPTMRInit();
+
+    while(1)
+    {
+
+  //  	PINS_DRV_TogglePins(PTD,1 << LED2);
+  //  	PINS_DRV_TogglePins(PTC,1 << LED);
+    	while (n<10000000)
+    	{
+    		n++;
+    	}
+    	n=0;
+    	if(dataReceived){
+    		AutoControl();
+    		dataReceived=false;
+    	}
+
+    }
+
+  /*** Don't write any code pass this line, or it will be deleted during code generation. ***/
+  /*** RTOS startup code. Macro PEX_RTOS_START is defined by the RTOS component. DON'T MODIFY THIS CODE!!! ***/
+  #ifdef PEX_RTOS_START
+    PEX_RTOS_START();                  /* Startup of the selected RTOS. Macro is defined by the RTOS component. */
+  #endif
+  /*** End of RTOS startup code.  ***/
+  /*** Processor Expert end of main routine. DON'T MODIFY THIS CODE!!! ***/
+  for(;;) {
+    if(exit_code != 0) {
+      break;
+    }
+  }
+  return exit_code;
+  /*** Processor Expert end of main routine. DON'T WRITE CODE BELOW!!! ***/
+} /*** End of main routine. DO NOT MODIFY THIS TEXT!!! ***/
+
+/* END main */
+/*!
+** @}
+*/
+/*
+** ###################################################################
+**
+**     This file was created by Processor Expert 10.1 [05.21]
+**     for the Freescale S32K series of microcontrollers.
+**
+** ###################################################################
+*/
